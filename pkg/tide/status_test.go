@@ -484,6 +484,19 @@ func TestExpectedStatus(t *testing.T) {
 			desc:  statusInPool,
 		},
 		{
+			name:              "not in pool, missing required context absent from commit",
+			labels:            neededLabels,
+			author:            "batman",
+			firstQueryAuthor:  "batman",
+			secondQueryAuthor: "batman",
+			milestone:         "v1.0",
+			requiredContexts:  []string{"newly-required-job"},
+			inPool:            false,
+
+			state: github.StatusPending,
+			desc:  fmt.Sprintf(statusNotInPool, " Job newly-required-job has not succeeded."),
+		},
+		{
 			name:              "not in pool, but all requirements are met, including a successful third-party context",
 			labels:            neededLabels,
 			author:            "batman",
@@ -731,6 +744,19 @@ func TestExpectedStatus(t *testing.T) {
 
 			state: github.StatusSuccess,
 			desc:  "In merge pool.",
+		},
+		{
+			name:              "not in pool with empty filtered override still reports missing policy context",
+			labels:            neededLabels,
+			author:            "batman",
+			firstQueryAuthor:  "batman",
+			secondQueryAuthor: "batman",
+			milestone:         "v1.0",
+			contexts:          []Context{{Context: githubql.String("job-name"), State: githubql.StatusStateSuccess}},
+			inPool:            false,
+
+			state: github.StatusSuccess,
+			desc:  statusInPool,
 		},
 	}
 
@@ -1318,60 +1344,52 @@ func TestRequirementDiff(t *testing.T) {
 			expectedDiff:         100,
 			expectedDescContains: "Blocked by GitHub (branch rulesets or protection)",
 		},
+		{
+			name:                 "Missing required context entirely from commit",
+			prContexts:           []Context{{Context: githubql.String("ci/present"), State: githubql.StatusStateSuccess}},
+			expectedDiff:         2,
+			expectedDescContains: "Job ci/missing has not succeeded",
+		},
 	}
-
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			pr := &PullRequest{
-				ReviewDecision:   tc.reviewDecision,
-				MergeStateStatus: githubql.String(tc.mergeStateStatus),
-				HeadRefOID:       githubql.String("abc123"),
+			var pr PullRequest
+			pr.BaseRef = struct {
+				Name   githubql.String
+				Prefix githubql.String
+			}{
+				Name: githubql.String(tc.prBaseBranch),
 			}
-
-			if tc.prBaseBranch != "" {
-				pr.BaseRef = struct {
-					Name   githubql.String
-					Prefix githubql.String
-				}{
-					Name: githubql.String(tc.prBaseBranch),
-				}
-			}
-
-			if tc.prAuthor != "" {
-				pr.Author = struct {
-					Login githubql.String
-				}{
-					Login: githubql.String(tc.prAuthor),
-				}
-			}
-
-			pr.Milestone = tc.prMilestone
-
 			for _, label := range tc.prLabels {
 				pr.Labels.Nodes = append(pr.Labels.Nodes, struct{ Name githubql.String }{Name: githubql.String(label)})
 			}
+			pr.Author = struct {
+				Login githubql.String
+			}{Login: githubql.String(tc.prAuthor)}
+			pr.Milestone = tc.prMilestone
+			pr.ReviewDecision = tc.reviewDecision
+			pr.MergeStateStatus = githubql.String(tc.mergeStateStatus)
+			pr.HeadRefOID = githubql.String("head")
 
-			if len(tc.prContexts) > 0 || len(tc.prCheckRuns) > 0 {
-				var checkRunNodes []CheckRunNode
-				for _, cr := range tc.prCheckRuns {
-					checkRunNodes = append(checkRunNodes, CheckRunNode{CheckRun: cr})
-				}
-				pr.Commits.Nodes = append(pr.Commits.Nodes, struct{ Commit Commit }{
-					Commit: Commit{
-						OID: githubql.String("abc123"),
-						Status: struct{ Contexts []Context }{
-							Contexts: tc.prContexts,
-						},
-						StatusCheckRollup: StatusCheckRollup{
-							Contexts: StatusCheckRollupContext{
-								Nodes: checkRunNodes,
-							},
+			var checkRunNodes []CheckRunNode
+			for _, checkRun := range tc.prCheckRuns {
+				checkRunNodes = append(checkRunNodes, CheckRunNode{CheckRun: checkRun})
+			}
+			pr.Commits.Nodes = append(pr.Commits.Nodes, struct{ Commit Commit }{
+				Commit: Commit{
+					OID: githubql.String("head"),
+					Status: struct{ Contexts []Context }{
+						Contexts: tc.prContexts,
+					},
+					StatusCheckRollup: StatusCheckRollup{
+						Contexts: StatusCheckRollupContext{
+							Nodes: checkRunNodes,
 						},
 					},
-				})
-			}
+				},
+			})
 
-			query := &config.TideQuery{
+			q := &config.TideQuery{
 				Labels:                 tc.queryLabels,
 				MissingLabels:          tc.queryForbiddenLabels,
 				Author:                 tc.queryAuthor,
@@ -1380,39 +1398,52 @@ func TestRequirementDiff(t *testing.T) {
 				IncludedBranches:       tc.queryIncludedBranches,
 				ReviewApprovedRequired: tc.reviewApprovedRequired,
 			}
-
-			// Set repository info for the PR (needed for EnforceGitHubMergeBlocks check)
-			pr.Repository = struct {
-				Name          githubql.String
-				NameWithOwner githubql.String
-				Owner         struct {
-					Login githubql.String
-				}
-			}{
-				Name: githubql.String("test-repo"),
-				Owner: struct {
-					Login githubql.String
-				}{
-					Login: githubql.String("test-org"),
-				},
+			cc := &config.TideContextPolicy{RequiredContexts: []string{"ci/missing"}}
+			if tc.name != "Missing required context entirely from commit" {
+				cc = &config.TideContextPolicy{}
 			}
 
-			cc := &config.TideContextPolicy{}
-
-			desc, diff := requirementDiff(pr, query, cc, config.GitHubMergeBlocksBlock)
-
+			desc, diff := requirementDiff(&pr, q, cc, config.GitHubMergeBlocksBlock)
 			if diff != tc.expectedDiff {
-				t.Errorf("Expected diff %d, but got %d", tc.expectedDiff, diff)
+				t.Errorf("expected diff %d, got %d", tc.expectedDiff, diff)
 			}
-
-			if tc.expectedDescContains != "" {
-				if !strings.Contains(desc, tc.expectedDescContains) {
-					t.Errorf("Expected description to contain %q, but got %q", tc.expectedDescContains, desc)
+			if tc.expectedDescContains == "" {
+				if desc != "" {
+					t.Errorf("expected empty description, got %q", desc)
 				}
-			} else if desc != "" {
-				t.Errorf("Expected empty description, but got %q", desc)
+			} else if !strings.Contains(desc, tc.expectedDescContains) {
+				t.Errorf("expected description %q to contain %q", desc, tc.expectedDescContains)
 			}
 		})
+	}
+}
+
+func TestContextCheckerGetterFactoryPreservesPolicyRequiredContextsWithoutOverride(t *testing.T) {
+	cfg := &config.Config{
+		JobConfig: config.JobConfig{
+			PresubmitsStatic: map[string][]config.Presubmit{
+				"org/repo": {{
+					JobBase: config.JobBase{
+						Name: "policy-required-job",
+					},
+					Reporter: config.Reporter{
+						Context: "policy-required-job",
+					},
+					AlwaysRun: true,
+				}},
+			},
+		},
+	}
+	ccg := contextCheckerGetterFactory(cfg, nil, "org", "repo", "main", func() (string, error) { return "", nil }, "head", nil)
+
+	cc, err := ccg()
+	if err != nil {
+		t.Fatalf("contextCheckerGetterFactory returned error: %v", err)
+	}
+
+	diff := cc.MissingRequiredContexts(nil)
+	if got, want := diff, []string{"policy-required-job"}; !cmp.Equal(got, want, cmpopts.SortSlices(func(a, b string) bool { return a < b })) {
+		t.Fatalf("required contexts mismatch (-got +want): %v", cmp.Diff(got, want, cmpopts.SortSlices(func(a, b string) bool { return a < b })))
 	}
 }
 
@@ -1531,7 +1562,7 @@ func TestGitHubMergeBlocksPolicy(t *testing.T) {
 			mergeStateStatus: "BLOCKED",
 			tideConfig: &config.Tide{
 				GitHubMergeBlocksPolicyMap: map[string]config.GitHubMergeBlocksPolicy{
-					"test-org":             config.GitHubMergeBlocksBlock,
+					"test-org":              config.GitHubMergeBlocksBlock,
 					"test-org/special-repo": config.GitHubMergeBlocksIgnore,
 				},
 			},
@@ -1544,7 +1575,7 @@ func TestGitHubMergeBlocksPolicy(t *testing.T) {
 			mergeStateStatus: "BLOCKED",
 			tideConfig: &config.Tide{
 				GitHubMergeBlocksPolicyMap: map[string]config.GitHubMergeBlocksPolicy{
-					"test-org":             config.GitHubMergeBlocksPermit,
+					"test-org":              config.GitHubMergeBlocksPermit,
 					"test-org/special-repo": config.GitHubMergeBlocksBlock,
 				},
 			},
